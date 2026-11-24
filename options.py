@@ -246,11 +246,6 @@ class MonodepthOptions:
                                  type=str,
                                  default=None,
                                  help="offline GCDID masks for the selected detector and resolution")
-        self.parser.add_argument("--gcidc_weight",
-                                 type=float,
-                                 metavar="GCIDC_WEIGHT",
-                                 help="GCIDC relative inverse-depth loss weight for contact propagation and extension",
-                                 default=0.1)
         self.parser.add_argument("--gcidc_flow_cache", type=str, default=None, help="Four-direction WAFT correspondence cache")
         self.parser.add_argument("--gcidc_road_cache", type=str, default=None,
                                  help="cached existing road masks for GCIDC")

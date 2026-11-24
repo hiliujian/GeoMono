@@ -49,7 +49,6 @@ GCDID（Ground-Constrained Dynamic Instance Detection，地面约束动态实例
 | 优化器 | AdamW，初始学习率 0.0001，权重衰减 0.01 |
 | 学习率调度 | ExponentialLR，每轮乘以 0.9 |
 | 后处理与评估 | 启用 `--post_process` 和 `--no_eval` |
-| GCIDC 权重 | 0.1 |
 | 数据目录 | `data/kitti/` |
 | 实例候选 | `candidates/kitti_dynamic_mask/` |
 | 路面分割 | `data/road_masks/` |
@@ -60,7 +59,9 @@ GCDID（Ground-Constrained Dynamic Instance Detection，地面约束动态实例
 
 ## 逆深度约束
 
-GCIDC（Ground Contact Inverse Depth Constraint，地面接触逆深度约束）在有几何支持的 GCDID 选区内生成逆深度目标。接触列传递道路尺度，三帧对应、实际相机内参和当前网络的分离位姿约束目标列的深度次序。接触列需在实例底缘紧邻可见道路，延伸范围由实际接触列围成，两处接地点之间的腾空车身可由三帧几何补全。缺少几何依据的像素保留为空。目标停止梯度，几何损失先在每张图的有效像素上求均值，再在批次内平均。 [训练实现](gcidc.py)
+GCIDC（Ground Contact Inverse Depth Constraint，地面接触逆深度约束）在 GCDID 选中的实例底缘寻找可观测接触。目标帧和前后相邻帧的双向光流、路面拟合残差和像素边界共同确定接触逆深度区间。整辆车找不到可信接地列时保留原预测。已有区间支撑且需要校正的像素投影到最近边界。同一接地实例的其他可观测像素沿拟合的接触轮廓扩展，校正幅度由接触观测区间和留一拟合误差自动计算。
+
+同一张逆深度监督图用于计算 GCIDC 损失。光度损失按图平均静态像素的误差，GCIDC 按图平均有目标像素的相对逆深度误差。两项各自在批次内求和后直接相加。GCIDC 目标停止梯度，无目标的图像在该项贡献零。 [目标与像素损失](gcidc.py) · [训练聚合](trainer.py)
 
 WAFT 光流、运动判决、道路和实例掩码的采样、GCIDC 实例索引整理、几何估计及两项方法的训练损失均在 CUDA 上计算。数据加载进程读取和解压缓存，计算在训练进程选定的 GPU 上执行。GCIDC 缓存的四向光流依次为目标帧到前帧、前帧到目标帧、目标帧到后帧、后帧到目标帧。训练发生水平翻转时同步变换掩码、坐标及光流水平分量。
 

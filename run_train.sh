@@ -9,7 +9,6 @@ TAG="${1:-GeoMono_GCDID_GCIDC_$(date +%Y%m%d_%H%M%S)}"
 MODE="${2:-full}"
 GPU="${3:-auto}"
 HEIGHT="${HEIGHT:-192}"; WIDTH="${WIDTH:-640}"
-GCIDC_WEIGHT="${GCIDC_WEIGHT:-0.1}"
 CACHE="${GCDID_CACHE:-$(python3 gcdid/temporal.py "$HEIGHT" "$WIDTH")}"
 DATA="${GCDID_DATA:-$PROJECT/data/kitti}"
 LOG_DIR="$(python3 -c 'import sys; from options import resolve_log_dir, validate_model_name; validate_model_name(sys.argv[2]); print(resolve_log_dir(sys.argv[1]))' "${LOG_DIR:-$PROJECT/tmp}" "$TAG")"
@@ -37,7 +36,7 @@ TRAIN=("$PROJECT/.venv_train/bin/python" -u train.py
   --split eigen_zhou --dataset kitti --height "$HEIGHT" --width "$WIDTH"
   --batch_size "${BATCH:-12}" --num_epochs "${EPOCHS:-20}" --num_workers "${WORKERS:-8}"
   --weights_init pretrained --frame_ids 0 -1 1 --scales 0 --post_process --no_eval --gcdid_cache "$CACHE"
-  --gcidc_weight "$GCIDC_WEIGHT" --gcidc_road_cache "$ROAD_CACHE" --gcidc_flow_cache "$FLOW_CACHE"
+  --gcidc_road_cache "$ROAD_CACHE" --gcidc_flow_cache "$FLOW_CACHE"
   "${EXTRA_FLAGS[@]}")
 echo "tag=$TAG mode=$MODE GPU=$GPU cache=$CACHE"
 if [[ "${DRYRUN:-0}" == 1 ]]; then

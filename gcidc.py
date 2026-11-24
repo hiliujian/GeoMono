@@ -1,29 +1,21 @@
 """Ground Contact Inverse Depth Constraint (GCIDC).
 
-Contact geometry fixes observed inverse depths. Three-frame correspondences
-constrain unobserved vehicle columns in the same target. The detached target
-and its validity mask supervise one relative inverse-depth loss on CUDA.
+The road fit and three-frame correspondences constrain inverse depth at visible
+contacts. Within grounded instances, additional pixels use the contact profile
+and its measured uncertainty to produce the same inverse-depth supervision.
 """
 import math
+
 import torch
-import torch.nn.functional as F
-# Constants for robust ground fitting and spatial column smoothing.
-C_ROBUST = 2.0
-ITERS = 5
+from torch.nn import functional as F
+
 EPS = 1e-8
-MAX_FACTOR = 3.0
-SMOOTH_COLS = 16
 
 
 def masked_median(values, valid):
     """Match torch.median's lower middle element without compacting on the host."""
     result = torch.nanmedian(values.masked_fill(~valid, float('nan')),dim=-1).values
     return torch.nan_to_num(result,nan=0.)
-
-
-def masked_mad(values, valid):
-    centre = masked_median(values,valid)
-    return 1.4826*masked_median((values-centre[...,None]).abs(),valid).clamp_min(EPS)
 
 
 def smallest_vector(covariance):
@@ -63,171 +55,271 @@ def smallest_vector(covariance):
     return vector.to(covariance.dtype)
 
 
-def ground_geometry(depth,seed_mask,K):
-    """Fit one ground plane per image with batched IRLS."""
-    B,H,W = depth.shape
-    yy,xx = torch.meshgrid(torch.arange(H,device=depth.device,dtype=depth.dtype),
-                          torch.arange(W,device=depth.device,dtype=depth.dtype),indexing='ij')
-    rx = (xx[None]-K[:,0,2,None,None])/K[:,0,0,None,None]
-    ry = (yy[None]-K[:,1,2,None,None])/K[:,1,1,None,None]
-    rays = torch.stack((rx,ry,torch.ones_like(rx)),1).flatten(2)
-    seed = (seed_mask&(depth>0)&torch.isfinite(depth)&(ry>0)).flatten(1)
-    z = torch.where(seed,depth.flatten(1),torch.zeros_like(depth.flatten(1)))
-    points = rays*z[:,None]
-    c0 = masked_median(points[:,1],seed)
-    n = torch.stack((torch.zeros_like(c0),torch.ones_like(c0),torch.zeros_like(c0)),1)
-    for _ in range(ITERS):
-        res = (n[:,:,None]*points).sum(1)-c0[:,None]
-        scale = masked_mad(res,seed)
-        weights = seed/(1.+(res/(C_ROBUST*scale[:,None])).square())
-        weight_sum = weights.sum(-1).clamp_min(EPS)
-        mu = (points*weights[:,None]).sum(-1)/weight_sum[:,None]
-        centred = points-mu[:,:,None]
-        cov = (centred*weights[:,None])@centred.transpose(1,2)
-        n = smallest_vector(cov)
-        orient = (n[:,:,None]*points*weights[:,None]).sum((1,2))
-        n = torch.where((orient<0)[:,None],-n,n)
-        good = (weights>.5)&seed
-        values = (n[:,:,None]*points).sum(1)
-        c0 = torch.where(good.sum(-1)>64,masked_median(values,good),masked_median(values,seed))
-    res = (n[:,:,None]*points).sum(1)-c0[:,None]
-    good = (weights>.5)&seed
-    sigma = torch.where(good.sum(-1)>64,masked_mad(res,good),masked_mad(res,seed))
-    nr = (n[:,:,None]*rays).sum(1).view(B,H,W)
-    plane = torch.where(nr>EPS,c0[:,None,None]/nr.clamp_min(EPS),torch.zeros_like(depth))
-    on_ground = (depth*nr-c0[:,None,None]).abs()<C_ROBUST*sigma[:,None,None]
-    valid = seed.sum(-1)>=256
-    return plane,on_ground,valid,n,c0,sigma
-
-
-def smooth_profile(raw, present, foot_prediction):
-    """Smooth the inverse-depth profile along observed columns."""
-    M, W = raw.shape
-    cols = torch.arange(W, device=raw.device)[None].expand(M, W)
-    compact = torch.where(present, cols, torch.full_like(cols, W)).sort(-1).values
-    compact_valid = compact < W
-    compact = compact.clamp(max=W-1)
-    prof = raw.gather(1, compact) * compact_valid
-    count = present.sum(-1)
-    radius = (count-1).clamp(1, SMOOTH_COLS).to(raw.dtype)
-    offsets = torch.arange(-SMOOTH_COLS, SMOOTH_COLS+1, device=raw.device, dtype=raw.dtype)
-    kernel = torch.exp(-.5*(offsets[None]/(radius[:,None]/2.).clamp_min(.5)).square())
-    kernel = kernel * (offsets.abs()[None] <= radius[:,None])
-    kernel = kernel / kernel.sum(-1, keepdim=True)
-    samples = F.pad(prof, (SMOOTH_COLS, SMOOTH_COLS)).unfold(-1, 2*SMOOTH_COLS+1, 1)
-    observed = F.pad((prof>0).to(raw.dtype), (SMOOTH_COLS, SMOOTH_COLS)).unfold(-1, 2*SMOOTH_COLS+1, 1)
-    numerator = (samples*kernel[:,None]).sum(-1)
-    denominator = (observed*kernel[:,None]).sum(-1)
-    smooth = numerator / denominator.clamp_min(1e-12)
-    z = smooth.clamp_min(EPS).reciprocal()
-    foot = foot_prediction.gather(1, compact)
-    good = ((denominator>1e-6)&(smooth>0)&(foot>0)&
-            (z<=MAX_FACTOR*foot)&(z*MAX_FACTOR>=foot))
-    smooth = torch.where(good, smooth, torch.zeros_like(smooth))
-    prof = torch.where((count>=3)[:,None], smooth, prof) * compact_valid
-    ranks = (present.long().cumsum(-1)-1).clamp_min(0)
-    return prof.gather(1, ranks) * present
-
-
-def extend_profile(profile):
-    """Harmonic gap interpolation and zero-slope end extension of inverse depth.
-
-    Known columns remain exact hard constraints. FP64 interpolation mirrors
-    NumPy interp in the frozen reference; target storage remains FP32.
-    """
-    M, W = profile.shape
-    cols = torch.arange(W, device=profile.device)[None].expand(M, W)
+def interpolate_contacts(profile):
+    """Interpolate inverse depth inside the span of measured contacts."""
+    width = profile.shape[1]
+    cols = torch.arange(width, device=profile.device)[None].expand_as(profile)
     known = profile > 0
-    left = torch.where(known, cols, torch.full_like(cols, -1)).cummax(-1).values
-    right = torch.where(known, cols, torch.full_like(cols, W)).flip(-1).cummin(-1).values.flip(-1)
-    first = torch.where(known, cols, torch.full_like(cols, W)).amin(-1, keepdim=True)
-    last = torch.where(known, cols, torch.full_like(cols, -1)).amax(-1, keepdim=True)
-    left = torch.where(left>=0, left, first).clamp(0,W-1)
-    right = torch.where(right<W, right, last).clamp(0,W-1)
-    u0, u1 = profile.gather(1,left).double(), profile.gather(1,right).double()
-    fraction = (cols-left).double() / (right-left).clamp_min(1).double()
-    return u0+(u1-u0)*fraction
+    left = torch.where(known, cols, -1).cummax(-1).values
+    right = torch.where(known, cols, width).flip(-1).cummin(-1).values.flip(-1)
+    bounded = (left >= 0) & (right < width)
+    left = left.clamp(0, width - 1)
+    right = right.clamp(0, width - 1)
+    u0 = profile.gather(1, left).double()
+    u1 = profile.gather(1, right).double()
+    fraction = (cols - left).double() / (right - left).clamp_min(1)
+    return u0 + (u1 - u0) * fraction, bounded
+
+
+def observed_cycle(flow, flipped):
+    """Measure uncertainty from both neighbouring frame cycles."""
+    batch, _, _, height, width = flow.shape
+    dtype, device = flow.dtype, flow.device
+    yy, xx = torch.meshgrid(torch.arange(height, device=device, dtype=dtype),
+                            torch.arange(width, device=device, dtype=dtype), indexing='ij')
+    pixel = torch.stack((xx, yy))
+    limits = pixel.new_tensor((width - 1, height - 1))[:, None, None]
+    start = pixel[None, None]
+    dst = start + flow[:, ::2]
+    finite = torch.isfinite(dst).all(2)
+    inside = finite & (dst >= 0).all(2) & (dst <= limits).all(2)
+    dst = torch.where(inside[:, :, None], dst, start)
+    grid = (2 * dst / limits - 1).flatten(0, 1).permute(0, 2, 3, 1)
+    reverse = F.grid_sample(flow[:, 1::2].flatten(0, 1), grid, mode='bilinear', align_corners=True)
+    back = dst + reverse.reshape(batch, 2, 2, height, width)
+    returned = torch.isfinite(back).all(2) & (back >= 0).all(2) & (back <= limits).all(2)
+    observed = (inside & returned).all(1)
+    extent = (back - start).abs().amax(1)
+    extent = torch.where(observed[:, None], extent, 0.)
+    return (torch.where(flipped[:, None, None], observed.flip(-1), observed),
+            torch.where(flipped[:, None, None, None], extent.flip(-1), extent))
+
+
+def measured_plane(depth, roadway, K):
+    """Fit a plane, then refit with a Cauchy scale measured from its residuals."""
+    batch, height, width = depth.shape
+    y, x = torch.meshgrid(torch.arange(height, device=depth.device, dtype=depth.dtype),
+                           torch.arange(width, device=depth.device, dtype=depth.dtype), indexing='ij')
+    rx = (x[None] - K[:, 0, 2, None, None]) / K[:, 0, 0, None, None]
+    ry = (y[None] - K[:, 1, 2, None, None]) / K[:, 1, 1, None, None]
+    rays = torch.stack((rx, ry, torch.ones_like(rx)), 1).flatten(2)
+    valid = (roadway & torch.isfinite(depth) & (depth > 0) & (ry > 0)).flatten(1)
+    z = torch.where(valid, depth.flatten(1), 0.)
+    points = rays * z[:, None]
+
+    def weighted_plane(weights):
+        total = weights.sum(1).clamp_min(EPS)
+        centre = (points * weights[:, None]).sum(2) / total[:, None]
+        delta = points - centre[:, :, None]
+        covariance = (delta * weights[:, None]) @ delta.transpose(1,2)
+        n = smallest_vector(covariance)
+        position = (n[:, :, None] * points).sum(1)
+        offset = masked_median(position, valid)
+        sign = torch.where(offset < 0, -1., 1.)
+        return n * sign[:, None], offset.abs(), position * sign[:, None], covariance
+
+    _, h, ge, _ = weighted_plane(valid.to(depth.dtype))
+    residual = ge - h[:, None]
+    # The absolute median residual gives the scale of a centred Cauchy model.
+    spread = masked_median(residual.abs(), valid).clamp_min(EPS)
+    weights = valid / (1 + (residual / spread[:, None]).square())
+    n, h, pos, covariance = weighted_plane(weights)
+    sigma = masked_median((pos - h[:, None]).abs(), valid)
+    eig = torch.linalg.eigvalsh(covariance.double())
+    rank = (eig[:, 1] > torch.finfo(depth.dtype).eps * eig[:, 2]) & (h > 0)
+    ray_product = (n[:, :, None] * rays).sum(1).view(batch,height,width)
+    plane = torch.where(ray_product>EPS,h[:,None,None]/ray_product.clamp_min(EPS),0.)
+    return plane,rank,n,h,sigma
+
+
+def contact_profile(anchor, lower, upper, bottom, normal, observed, x, K, samples):
+    """Fit a local contact line and estimate both sources of inverse-depth error."""
+    count = observed.sum(1, keepdim=True)
+    width = observed.shape[1]
+    columns = torch.where(observed, x, width).sort(1).values[:, :samples]
+    valid = columns < width
+    indices = columns.clamp_max(width - 1)
+    points = indices.to(anchor.dtype)
+
+    def gather(values):
+        return torch.where(valid, values.gather(1, indices), 0.)
+
+    z = gather(anchor)
+    count = count.to(anchor.dtype)
+    centre = (points * valid).sum(1, keepdim=True) / count
+    variance = ((points - centre).square() * valid).sum(1, keepdim=True) / count
+    # The variance of uniform subpixel quantization is 1/12 pixel squared.
+    bandwidth = (variance + 1. / 12.).sqrt() * (4. / (3. * count)).pow(1. / 5.)
+    first = torch.where(observed, x, width).amin(1, keepdim=True)
+    last = torch.where(observed, x, 0).amax(1, keepdim=True)
+    query = x.clamp(first, last).to(anchor.dtype)
+
+    def weights_at(position, allowed):
+        delta = points[:, None] - position[..., None]
+        log_weights = (-0.5 * (delta / bandwidth[..., None]).square()).masked_fill(~allowed, -torch.inf)
+        peak = torch.where(allowed.any(-1, keepdim=True), log_weights.amax(-1, keepdim=True), 0.)
+        weights = (log_weights - peak).exp()
+        weights = weights / weights.sum(-1, keepdim=True).clamp_min(EPS)
+        mean_x = (weights * delta).sum(-1)
+        centred = delta - mean_x[..., None]
+        var_x = (weights * centred.square()).sum(-1)
+        return weights, mean_x, centred, var_x
+
+    def fit(values, weights, mean_x, centred, var_x):
+        mean = (weights * values[:, None]).sum(-1)
+        slope = (weights * centred * (values[:, None] - mean[..., None])).sum(-1) / var_x.clamp_min(EPS)
+        return mean, slope, mean - slope * mean_x
+
+    weights, mean_x, centred, var_x = weights_at(query, valid[:, None])
+    mean, slope, estimate = fit(z, weights, mean_x, centred, var_x)
+    linear = (estimate > 0) & (var_x > 0)
+    estimate = torch.where(linear, estimate, mean)
+    alpha = torch.where(linear[..., None],
+                        weights - weights * centred * mean_x[..., None] / var_x.clamp_min(EPS)[..., None],
+                        weights)
+    # A negative fit coefficient exchanges the endpoints of its propagated interval.
+    low_delta = alpha * (gather(lower) - z)[:, None]
+    high_delta = alpha * (gather(upper) - z)[:, None]
+    geometry_low = estimate + torch.minimum(low_delta, high_delta).sum(-1)
+    geometry_high = estimate + torch.maximum(low_delta, high_delta).sum(-1)
+
+    allowed = valid[:, :, None] & valid[:, None, :]
+    allowed &= ~torch.eye(samples, device=anchor.device, dtype=torch.bool)
+    loo = weights_at(points, allowed)
+    _, _, held_out = fit(z, *loo)
+    observable = valid & (count >= 3) & (loo[-1] > 0) & torch.isfinite(held_out)
+    residual = torch.where(observable, (held_out - z).abs(), 0.)
+    margin = (alpha.abs() * residual[:, None]).sum(-1)
+
+    # A vertical surface normal is perpendicular to the estimated road normal.
+    _, foot_slope, foot = fit(gather(bottom.to(anchor.dtype)), weights, mean_x, centred, var_x)
+    normals = normal.gather(1, indices[..., None].expand(-1, -1, 3))
+    nx, ny, nz = (weights @ normals).unbind(-1)
+    fx, fy = K[:, 0, 0, None], K[:, 1, 1, None]
+    cx, cy = K[:, 0, 2, None], K[:, 1, 2, None]
+    u = nx * fx + nz * (cx - query)
+    v = ny * fy + nz * (cy - foot)
+    denominator = v - u * foot_slope
+    divided = denominator.abs() > EPS
+    slope_y = -(u * slope + nz * estimate) / torch.where(divided, denominator, 1.)
+    slope_y = torch.where(linear & divided & torch.isfinite(slope_y), slope_y, 0.)
+    return estimate, geometry_low, geometry_high, margin, foot, slope_y, first, last
 
 
 @torch.no_grad()
 def build_targets(depth, grid, moving, K, cells, cell_valid, batch_index, road, flow, intrinsics, poses, flipped):
-    """CUDA tensors: B,H,W images, B,3,3 K, padded M,L instance cell metadata.
-
-    Road is the union of existing SAM road and road-marking masks, transformed
-    in the same orientation as the target RGB. It is not a motion mask.
-    """
-    if depth.device.type != 'cuda':
+    """Build one inverse-depth target map from grounded-instance evidence."""
+    if not depth.is_cuda:
         raise ValueError('GCIDC target generation requires CUDA tensors')
-    B,H,W = depth.shape
-    M,L = cells.shape
-    plane,ground,frame_valid,n,c0,sigma = ground_geometry(depth,grid<0,K)
-    visible_road = road.bool() & (grid<0)
-    road_plane,_,road_valid,road_n,road_h,_ = ground_geometry(depth,visible_road,K)
-    flat = depth.reshape(-1)
-    indices = cells + batch_index[:,None]*(H*W)
-    values = flat[indices]
-    valid = cell_valid & torch.isfinite(values) & (values>0)
-    y,x = cells.div(W,rounding_mode='floor'),cells.remainder(W)
-    count = valid.sum(-1)
-    requested = (moving.flatten()[indices]&valid).any(-1)
-    selected = requested & (count>=4)
-    bottom = torch.full((M,W),-1,device=depth.device,dtype=torch.long)
-    bottom.scatter_reduce_(1,x,torch.where(valid,y,torch.full_like(y,-1)),reduce='amax',include_self=True)
-    present = bottom>=0
-    cols = torch.arange(W,device=depth.device)[None].expand(M,W)
-    below = (bottom+1).clamp(max=H-1)
-    foot_idx = batch_index[:,None]*(H*W)+bottom.clamp_min(0)*W+cols
-    below_idx = batch_index[:,None]*(H*W)+below*W+cols
-    foot,zn = flat[foot_idx],flat[below_idx]
+    batch,height,width = depth.shape
+    if flow.shape != (batch, 4, 2, height, width):
+        raise ValueError('GCIDC needs both directions for each neighbouring frame')
+    instances = cells.shape[0]
+    roadway = road.bool() & (grid < 0)
+    _,road_valid,road_normal,road_offset,road_sigma = measured_plane(depth, roadway, K)
+    plane,plane_valid,normal,offset,sigma = measured_plane(depth, grid < 0, K)
+    tracks,extent = observed_cycle(flow, flipped)
+    area = height * width
+    flat = depth.flatten()
+    index = cells + batch_index[:, None] * area
+    raw = flat[index]
+    valid = cell_valid & torch.isfinite(raw) & (raw > 0)
+    selected = (valid & moving.flatten()[index]).any(1)
+    rows,cols = cells.div(width, rounding_mode='floor'),cells.remainder(width)
+    bottom = torch.full((instances,width),-1,device=depth.device,dtype=torch.long)
+    bottom.scatter_reduce_(1,cols,torch.where(valid,rows,-1),reduce='amax',include_self=True)
+    x = torch.arange(width, device=depth.device)[None]
+    below = batch_index[:, None] * area + (bottom+1).clamp(max=height-1)*width + x
+    adjacent = flat[below]
+    contact = selected[:, None] & (bottom >= 0) & (bottom < height - 1)
+    contact &= (grid.flatten()[below] < 0) & tracks.flatten()[below]
+    contact &= torch.isfinite(adjacent) & (adjacent > 0)
+    use_road = roadway.flatten()[below] & road_valid[batch_index, None]
+    fit = torch.where(use_road, road_valid[batch_index, None], plane_valid[batch_index, None])
+    h = torch.where(use_road, road_offset[batch_index, None], offset[batch_index, None])
+    noise = torch.where(use_road, road_sigma[batch_index, None], sigma[batch_index, None])
+    n = torch.where(use_road[..., None], road_normal[batch_index, None], normal[batch_index, None])
+    contact &= fit & (h > noise)
 
-    def contact_profile(surface,on_ground):
-        zc = surface.flatten()[foot_idx]
-        ok = on_ground.flatten()[below_idx]&present&(bottom<H-1)&(surface.flatten()[below_idx]>0)
-        bracket = ok&(zc>0)&(zn>0)
-        zc = torch.where(bracket,2./(zc.clamp_min(EPS).reciprocal()+zn.clamp_min(EPS).reciprocal()),zc)
-        keep = ok&(zc>0)&(zn>0)&(zc<=MAX_FACTOR*zn)&(zc*MAX_FACTOR>=zn)
-        return torch.where(keep,zc.clamp_min(EPS).reciprocal(),torch.zeros_like(zc)),keep
+    k = K[batch_index]
+    nx,ny,nz = n.unbind(-1)
+    rx = (x.to(depth.dtype)-k[:,0,2,None])/k[:,0,0,None]
+    ry = (bottom.to(depth.dtype)-k[:,1,2,None])/k[:,1,1,None]
+    foot = nx*rx + ny*ry + nz
+    step = ny/k[:,1,1,None]
+    reprojection = (nx.abs()*extent[:,0].flatten()[below]/k[:,0,0,None] +
+                    ny.abs()*extent[:,1].flatten()[below]/k[:,1,1,None])
+    observed = adjacent.clamp_min(EPS).reciprocal()
+    offset_inverse = step/h.clamp_min(EPS)
+    flow_uncertainty = reprojection/h.clamp_min(EPS)
+    measured_low = torch.minimum(observed, observed-offset_inverse) - flow_uncertainty
+    measured_high = torch.maximum(observed, observed-offset_inverse) + flow_uncertainty
+    plane_low = (torch.minimum(foot,foot+step)-reprojection)/(h+noise).clamp_min(EPS)
+    plane_high = (torch.maximum(foot,foot+step)+reprojection)/(h-noise).clamp_min(EPS)
+    low = torch.maximum(measured_low, plane_low)
+    high = torch.minimum(measured_high, plane_high)
+    trusted = contact & (low > 0) & (high >= low) & torch.isfinite(low) & torch.isfinite(high)
+    low_profile,bounded = interpolate_contacts(torch.where(trusted,low,0.))
+    high_profile,_ = interpolate_contacts(torch.where(trusted,high,0.))
+    inverse = raw.clamp_min(EPS).reciprocal()
+    candidate = inverse.double().clamp(low_profile.gather(1,cols),high_profile.gather(1,cols)).to(inverse.dtype)
+    direct = valid & bounded.gather(1,cols) & (candidate != inverse)
+    applied = direct.clone()
 
-    raw,_ = contact_profile(plane,ground)
-    original_profile = smooth_profile(raw,present,foot)
-    original_profile = original_profile*selected[:,None]*frame_valid[batch_index,None]
-    old = original_profile.gather(1,x)
-    original_valid = valid&(old>0)
-    original_u = torch.where(original_valid,old,torch.zeros_like(old))
-    has_original = original_valid.any(-1)
+    plane_contact = (foot + 0.5 * step) / h.clamp_min(EPS)
+    midpoint = (foot / h.clamp_min(EPS) + observed) * 0.5
+    profile = (trusted | (contact & use_road & (plane_contact > 0) & torch.isfinite(plane_contact)))
+    profile &= trusted.any(1, keepdim=True) & (midpoint > 0) & torch.isfinite(midpoint)
+    counts = profile.sum(1)
+    profiles = torch.where(counts > 0)[0]
+    order = profiles[counts[profiles].argsort(descending=True)]
+    lower = torch.minimum(midpoint, (measured_low + plane_low) * 0.5)
+    upper = torch.maximum(midpoint, (measured_high + plane_high) * 0.5)
+    start = 0
+    while start < order.numel():
+        samples = int(counts[order[start]])
+        # Bound the temporary profile tensor by the size of the image batch.
+        length = max(1, batch * height // samples)
+        ids = order[start:start + length]
+        start += length
+        estimate, geo_lo, geo_hi, margin, foot_row, slope_y, first, last = contact_profile(
+            midpoint[ids], lower[ids], upper[ids], bottom[ids], n[ids], profile[ids], x, k[ids], samples)
+        cols_i = cols[ids]
+        raw_i = inverse[ids]
+        estimate_i = estimate.gather(1, cols_i)
+        upright = estimate_i + slope_y.gather(1, cols_i) * (rows[ids] - foot_row.gather(1, cols_i))
+        upright = torch.where((upright > 0) & torch.isfinite(upright), upright, estimate_i)
+        geometry = raw_i.clamp(geo_lo.gather(1, cols_i), geo_hi.gather(1, cols_i))
+        error = margin.gather(1, cols_i)
+        held_out = raw_i.clamp(estimate_i - error, estimate_i + error)
 
-    # Verify road contact and evaluate the anchor at the bottom pixel boundary.
-    _,contact_ok = contact_profile(road_plane,visible_road)
-    bn,bh,bK = road_n[batch_index],road_h[batch_index],K[batch_index]
-    rx = (cols.to(depth.dtype)-bK[:,0,2,None])/bK[:,0,0,None]
-    ry = (bottom.clamp_min(0).to(depth.dtype)-bK[:,1,2,None])/bK[:,1,1,None]
-    nr = bn[:,0,None]*rx+bn[:,1,None]*ry+bn[:,2,None]
-    inverse_foot = (nr+bn[:,1,None]/bK[:,1,1,None]/2.)/bh[:,None]
-    zc = inverse_foot.clamp_min(EPS).reciprocal()
-    road_raw = torch.where(contact_ok,zc.clamp_min(EPS).reciprocal(),torch.zeros_like(zc))
-    road_profile = smooth_profile(road_raw,present,foot)
-    profile = torch.where(has_original[:,None],original_profile,road_profile)
-    extended = extend_profile(profile).gather(1,x)
-    z = extended.clamp_min(EPS).reciprocal()
-    foot_at_cell = foot.gather(1,x)
-    good = torch.isfinite(extended)&(extended>EPS)&(z<=MAX_FACTOR*foot_at_cell)&(z*MAX_FACTOR>=foot_at_cell)
-    atomic = (good|~valid).all(-1) & (road_profile>0).any(-1)
-    accepted = selected & road_valid[batch_index] & (has_original|atomic)
-    added = valid&~original_valid&good&accepted[:,None]
-    final_u = torch.where(added,extended.to(depth.dtype),original_u)
-    final_valid = original_valid|added
-    output_index = torch.where(valid,indices,torch.full_like(indices,B*H*W)).flatten()
-    def raster(value):
-        output = torch.zeros(B*H*W+1,device=depth.device,dtype=value.dtype)
-        output.scatter_(0,output_index,value.flatten())
-        return output[:-1].view(B,H,W)
-    target, mask = raster(final_u), raster(final_valid)
-    from gcidc_cuda import complete
-    complete(depth, grid, cells, valid, batch_index, requested, road, target, mask,
-             flow, intrinsics, poses, flipped)
-    return dict(u_t=target,mask=mask,
-                original_u_t=raster(original_u),original_mask=raster(original_valid),
-                n=n,c0=c0,sigma=sigma,z_plane=plane)
+        low_i, high_i = torch.minimum(raw_i, upright), torch.maximum(raw_i, upright)
+        geometry = torch.where((geometry > 0) & torch.isfinite(geometry), geometry, raw_i)
+        held_out = torch.where((held_out > 0) & torch.isfinite(held_out), held_out, raw_i)
+        unsupported_geometry = (upright - geometry.clamp(low_i, high_i)).abs()
+        unsupported_fit = (upright - held_out.clamp(low_i, high_i)).abs()
+        correction = upright - raw_i
+        change = correction.abs()
+        amount = change / (change + unsupported_geometry + unsupported_fit).clamp_min(torch.finfo(raw_i.dtype).tiny)
+        extended = raw_i + amount * correction
+
+        supported = ((cols_i >= first) & (cols_i <= last)) | tracks.flatten()[index[ids]]
+        extend = (valid[ids] & ~direct[ids] & supported & (upright > 0) & (extended > 0)
+                  & torch.isfinite(extended) & (extended != raw_i))
+        candidate[ids] = torch.where(extend, extended, candidate[ids])
+        applied[ids] = direct[ids] | extend
+
+    target_index = torch.where(applied,index,batch*area).flatten()
+
+    def raster(values):
+        output = values.new_zeros(batch*area+1)
+        output.scatter_(0,target_index,values.flatten())
+        return output[:-1].view(batch,height,width)
+
+    target,mask = raster(candidate),raster(applied)
+    original = raster(direct)
+    return dict(u_t=target,mask=mask,original_u_t=torch.where(original, target, 0.),original_mask=original,
+                n=normal,c0=offset,sigma=sigma,z_plane=plane)
 
 
 def loss_per_image(depth,target,mask):

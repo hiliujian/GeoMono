@@ -173,7 +173,7 @@ class Trainer:
         cache = self.opt.gcdid_cache
         train_dataset = MotionDataset(train_dataset, cache, self.opt.gcidc_road_cache, self.opt.gcidc_flow_cache)
         print("GCDID cache:", cache)
-        print("Depth supervision: GCIDC (CUDA, weight={})".format(self.opt.gcidc_weight))
+        print("Depth supervision: GCIDC (CUDA)")
         print("GCIDC road cache:", self.opt.gcidc_road_cache)
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
@@ -606,7 +606,7 @@ class Trainer:
                 # Evaluate GCIDC at scale zero, the resolution of the cached instance grid.
                 gcidc_term = self.compute_gcidc_loss(
                     inputs, outputs[("depth", 0, scale)], outputs)
-                loss = loss + self.opt.gcidc_weight * gcidc_term
+                loss = loss + gcidc_term
                 losses["loss/gcidc/{}".format(scale)] = gcidc_term
             total_loss = total_loss + loss
             losses["loss/{}".format(scale)] = loss
@@ -617,10 +617,10 @@ class Trainer:
 
     # ------------------------------------------ Ground Contact Inverse Depth Constraint (GCIDC)
     def compute_gcidc_loss(self, inputs, depth, outputs=None):
-        """Build detached GCIDC targets and average the loss over the batch.
+        """Sum per-image GCIDC losses from detached targets.
 
         Each image averages its valid target pixels. Images without targets
-        contribute zero, so sparse targets do not increase other images' weight.
+        contribute zero.
         """
         depth = depth[:, 0] if depth.dim() == 4 else depth
         if "dynamic_mask" not in inputs:
@@ -651,7 +651,7 @@ class Trainer:
             outputs["gcidc/u_t"] = target
             outputs["gcidc/mask"] = mask
             outputs["gcidc/original_mask"] = comp["original_mask"]
-        return per_image.mean()
+        return per_image.sum()
 
     @staticmethod
     def extract_ambiguity(ipt):
