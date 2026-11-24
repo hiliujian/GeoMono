@@ -64,6 +64,7 @@ class Trainer:
     def __init__(self, options):
         self.opt = options
         self.opt.depth_supervision = "gcidc_three_frame_contact_cuda"
+        self.opt.gcidc_weight = 0.1
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
         self.splits_dir = os.path.join(os.path.dirname(__file__), "splits")
         self.eval_available = True
@@ -173,7 +174,7 @@ class Trainer:
         cache = self.opt.gcdid_cache
         train_dataset = MotionDataset(train_dataset, cache, self.opt.gcidc_road_cache, self.opt.gcidc_flow_cache)
         print("GCDID cache:", cache)
-        print("Depth supervision: GCIDC (CUDA)")
+        print(f"Depth supervision: GCIDC (CUDA, weight={self.opt.gcidc_weight})")
         print("GCIDC road cache:", self.opt.gcidc_road_cache)
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
@@ -606,7 +607,7 @@ class Trainer:
                 # Evaluate GCIDC at scale zero, the resolution of the cached instance grid.
                 gcidc_term = self.compute_gcidc_loss(
                     inputs, outputs[("depth", 0, scale)], outputs)
-                loss = loss + gcidc_term
+                loss = loss + self.opt.gcidc_weight * gcidc_term
                 losses["loss/gcidc/{}".format(scale)] = gcidc_term
             total_loss = total_loss + loss
             losses["loss/{}".format(scale)] = loss
@@ -617,7 +618,7 @@ class Trainer:
 
     # ------------------------------------------ Ground Contact Inverse Depth Constraint (GCIDC)
     def compute_gcidc_loss(self, inputs, depth, outputs=None):
-        """Sum per-image GCIDC losses from detached targets.
+        """Average per-image GCIDC losses from detached targets.
 
         Each image averages its valid target pixels. Images without targets
         contribute zero.
@@ -651,7 +652,7 @@ class Trainer:
             outputs["gcidc/u_t"] = target
             outputs["gcidc/mask"] = mask
             outputs["gcidc/original_mask"] = comp["original_mask"]
-        return per_image.sum()
+        return per_image.mean()
 
     @staticmethod
     def extract_ambiguity(ipt):
