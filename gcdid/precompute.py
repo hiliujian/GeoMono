@@ -114,7 +114,7 @@ def reference_keys(split):
 
 def calibration_signature(reference, args):
     files = [ROOT / 'gcdid' / name for name in (
-        'flow.py', 'instances.py', 'sampling.py', 'ground/camera.py', 'ground/cuda_inputs.py',
+        'flow.py', 'instances.py', 'sampling.py', 'precompute.py', 'ground/camera.py', 'ground/cuda_inputs.py',
         'ground/cuda_ops.py', 'ground/detector.py', 'ground/geometry_kernels.cu', 'ground/reference.py',
         'ground/road_dispersion.json', 'ground/settings.py', 'ground/visual_pose.py')]
     waft = ROOT / 'third_party/WAFT'
@@ -144,7 +144,7 @@ def build(args, road_frames=None, keys=None):
     import torch
     from gcdid.ground.cuda_inputs import inputs, optical_matrix
     from gcdid.ground.detector import measure, empty_evidence
-    from gcdid.ground.reference import fit_reference
+    from gcdid.ground.reference import fit_reference, grouped_evidence, grouped_sources, observation_regions, reference_grid
     from gcdid.flow import FlowModel
     from gcdid.instances import at_frame, candidate_grids, image_path
     from gcdid.road_cache import read_masks, resize_road, save_road
@@ -174,12 +174,15 @@ def build(args, road_frames=None, keys=None):
     summary = cache / 'summary.json'
     manifest = cache / 'requested_frames.json'
 
-    def prepare_road(key, detection_needed=False):
+    def prepare_road(key, detection_needed=False, shared=None):
         if road_frames is None:
             return None
         destination = road_frames / (key + '.npz')
         write = not destination.is_file()
         if not (write or detection_needed):
+            return None
+        if shared is not None and (h, w) == DETECTION_SIZE:
+            save_road(destination, shared)
             return None
         masks = read_masks(Path(cfg['road_masks']) / (key + '.npz')).cuda()
         native_road = masks.bool().any(0)
@@ -241,7 +244,7 @@ def build(args, road_frames=None, keys=None):
         np.savez_compressed(tmp, **arrays)
         tmp.replace(path)
 
-    def replay(key, grid, groups, road_input=None):
+    def replay(key, grid, groups):
         number = int(key.split('__')[2])
         paths = [image_path(cfg['data'], at_frame(key, number + k)) for k in (-1, 0, 1)]
         missing = next((p for p in paths if not p.is_file()), None)
@@ -249,13 +252,26 @@ def build(args, road_frames=None, keys=None):
             raise FileNotFoundError(f'GCDID triplet for {key} is missing {missing}')
         groups = torch.as_tensor(groups, device='cuda')
         if not len(groups):
+            prepare_road(key)
             return empty_evidence(len(groups), groups.device)
         with torch.inference_mode():
             flow, endpoint_flow = flow_model().triplet(paths, *DETECTION_SIZE, endpoints=True)
-            if road_input is None:
-                road_input = inputs(cfg['road_masks'], key, flow.device, cfg['data'])
-            road, intrinsics = road_input
-            out = measure(road, intrinsics, flow, torch.as_tensor(grid, device=flow.device), groups, endpoint_flow)
+            grid = torch.as_tensor(grid, device=flow.device)
+            candidates = Path(cfg['candidates']) / (key + '.npz')
+            semantics = Path(cfg['road_masks']) / (key + '.npz')
+            lineage = grouped_sources(candidates, semantics)
+            parents = None
+            if all(lineage):
+                native, road, width, height, sources = reference_grid(semantics, grid)
+                grid, parents = observation_regions(grid, native, sources, lineage)
+                prepare_road(key, shared=road)
+                intrinsics = optical_matrix(cfg['data'], key, width, height, flow.device)
+            elif road_frames is not None:
+                road, intrinsics = prepare_road(key, detection_needed=True)
+            else:
+                road, intrinsics = inputs(cfg['road_masks'], key, flow.device, cfg['data'])
+            parts = measure(road, intrinsics, flow, grid, groups if parents is None else groups[parents], endpoint_flow)
+            out = grouped_evidence(parts, parents, len(groups))
             out['selected'] = out['score'] > threshold
             return out
 
@@ -290,12 +306,12 @@ def build(args, road_frames=None, keys=None):
         groups = torch.as_tensor(record['groups'], device=grid.device)
         if (h, w) != DETECTION_SIZE and len(groups):
             detector_grid = candidate_grids(candidate_path, *DETECTION_SIZE)[0]
-        evidence = warmed.pop(key, None)
-        road_input = prepare_road(key, detection_needed=evidence is None and bool(len(groups)))
-        if evidence is None:
-            evidence = replay(key, detector_grid, groups, road_input=road_input)
-        else:
+        if key in warmed:
+            evidence, road = warmed.pop(key)
+            prepare_road(key, shared=road)
             evidence['selected'] = evidence['score'] > threshold
+        else:
+            evidence = replay(key, detector_grid, groups)
         selected = evidence['selected']
         flags = torch.cat((selected.new_zeros(1), selected))
         moving = flags[grid + 1]

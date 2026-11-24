@@ -5,10 +5,10 @@ from zipfile import ZipFile
 import numpy as np
 import torch
 
-from ..instances import GROUPS, at_frame, candidate_grids, image_path
+from ..instances import GROUPS, at_frame, candidate_grids, candidate_names, image_path
 from ..sampling import nearest_axis
 from .cuda_inputs import optical_matrix
-from .detector import measure
+from .detector import empty_evidence, measure
 from .settings import H, W, ROAD
 
 
@@ -54,14 +54,70 @@ def reference_grid(path, candidates):
         rank = masks.sum((1, 2)) * (count + 1) + ids
         minimum = torch.minimum(minimum, torch.where(sampled, rank[:, None, None], background).amin(0))
     if not any(label in GROUPS for label in labels):
-        return candidates, road, width, height
+        return candidates, road, width, height, torch.empty(0, device=device, dtype=torch.long)
     owner = minimum.remainder(count + 1)
     eligible = torch.tensor([label in GROUPS for label in labels] + [False], device=device)
     visible = (candidates >= 0) & (minimum < background) & eligible[owner]
     ids = owner[visible].unique()
     remap = torch.full((count + 1,), -1, device=device, dtype=torch.int16)
     remap[ids] = torch.arange(len(ids), device=device, dtype=torch.int16)
-    return torch.where(visible, remap[owner], -1), road, width, height
+    return torch.where(visible, remap[owner], -1), road, width, height, ids
+
+
+def grouped_sources(candidates, semantics):
+    """Read a rider's cycle origin and absorbed human proposals from the mask provenance."""
+    with np.load(candidates, allow_pickle=False) as source:
+        if 'src' not in source:
+            return (), ()
+        riders = [i for i, name in enumerate(candidate_names(source['labels']))
+                  if name in ('rider', 'cyclist', 'bicyclist', 'motorcyclist')]
+        if not riders:
+            return (), ()
+        origins = source['src'].tolist()
+    with np.load(semantics, allow_pickle=True) as source:
+        names = [str(name).lower() for name in source['labels']]
+    merged = [i for i in riders if 0 <= origins[i] < len(names)
+              and names[origins[i]] in ('bicycle', 'motorcycle', 'motorbike')]
+    retained = set(origins)
+    absorbed = [i for i, name in enumerate(names) if i not in retained and
+                name in ('person', 'pedestrian', 'rider', 'cyclist', 'bicyclist', 'motorcyclist')]
+    return merged, absorbed
+
+
+def observation_regions(grid, native, sources, lineage):
+    """Keep a single output owner for all original surfaces of a merged silhouette."""
+    owners, absorbed = lineage
+    if not owners or not absorbed or not len(sources):
+        return grid, None
+    device = grid.device
+    is_part = torch.isin(sources, torch.as_tensor(absorbed, device=device))
+    in_owner = torch.isin(grid.long(), torch.as_tensor(owners, device=device))
+    new_part = in_owner & (native >= 0) & is_part[native.long().clamp_min(0)]
+    if not new_part.any():
+        return grid, None
+    inside = grid >= 0
+    component = torch.where(new_part, native.long() + 1, 0)
+    stride = len(sources) + 1
+    key = grid[inside].long() * stride + component[inside]
+    pairs, local = torch.unique(key, sorted=True, return_inverse=True)
+    regions = torch.full_like(grid, -1)
+    regions[inside] = local.to(regions.dtype)
+    return regions, pairs.div(stride, rounding_mode='floor')
+
+
+def grouped_evidence(measurements, parents, count):
+    """Motion evidence on any constituent belongs to the full instance."""
+    if parents is None:
+        return measurements
+    output = empty_evidence(count, parents.device)
+    for key in ('score', 'scores', 'coverage', 'contact_columns'):
+        values = measurements[key]
+        indices = parents.expand_as(values)
+        output[key].scatter_reduce_(-1, indices, values, reduce='amax')
+    output['contact'] = output['contact_columns'] > 0
+    for key in ('road_h', 'road_variance'):
+        output[key] = measurements[key]
+    return output
 
 
 def same_partition(first, second):
@@ -91,18 +147,22 @@ def fit_partition(values):
 def fit_reference(keys, settings, model):
     samples, measurements = [], {}
     for key in keys:
-        grid, _, groups = candidate_grids(Path(settings['candidates']) / (key + '.npz'), H, W)
+        candidates = Path(settings['candidates']) / (key + '.npz')
+        semantics = Path(settings['road_masks']) / (key + '.npz')
+        grid, _, groups = candidate_grids(candidates, H, W)
         if not len(groups) or not (grid >= 0).any():
             continue
-        native, road, width, height = reference_grid(Path(settings['road_masks']) / (key + '.npz'), grid)
+        native, road, width, height, sources = reference_grid(semantics, grid)
+        regions, parents = observation_regions(grid, native, sources, grouped_sources(candidates, semantics))
         intrinsics = optical_matrix(settings['data'], key, width, height, grid.device)
         frame = int(key.split('__')[2])
         paths = [image_path(settings['data'], at_frame(key, frame + offset)) for offset in (-1, 0, 1)]
         flow, span = model().triplet(paths, H, W, endpoints=True)
-        evidence = measure(road, intrinsics, flow, grid, torch.as_tensor(groups, device=grid.device), span)
-        measurements[key] = evidence
-        if same_partition(grid, native):
-            samples.append(evidence['score'][grid[grid >= 0].long().unique()])
+        labels = torch.as_tensor(groups, device=grid.device)
+        parts = measure(road, intrinsics, flow, regions, labels if parents is None else labels[parents], span)
+        measurements[key] = (grouped_evidence(parts, parents, len(groups)), road)
+        if same_partition(regions, native):
+            samples.append(parts['score'][regions[regions >= 0].long().unique()])
         elif (native >= 0).any():
             size = int(native.max()) + 1
             observation = measure(road, intrinsics, flow, native, native.new_zeros(size), span)
