@@ -1,4 +1,4 @@
-"""Read rectified camera optics for the GCIDC correspondence grid."""
+"""Read rectified camera optics for the GCDID detector grid."""
 import json
 from functools import lru_cache
 from pathlib import Path

@@ -63,7 +63,7 @@ def eval_batch_post_process_disparity(l_disp, r_disp):
 class Trainer:
     def __init__(self, options):
         self.opt = options
-        self.opt.depth_supervision = "gcidc_three_frame_contact_cuda"
+        self.opt.depth_supervision = "gcidc_single_frame_contact_cuda"
         self.opt.gcidc_weight = 0.1
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
         self.splits_dir = os.path.join(os.path.dirname(__file__), "splits")
@@ -172,9 +172,9 @@ class Trainer:
             self.opt.frame_ids, 4, is_train=True, img_ext=img_ext, load_depth=False)
         from gcdid.dataset import MotionDataset, motion_collate
         cache = self.opt.gcdid_cache
-        train_dataset = MotionDataset(train_dataset, cache, self.opt.gcidc_road_cache, self.opt.gcidc_flow_cache)
+        train_dataset = MotionDataset(train_dataset, cache, self.opt.gcidc_road_cache)
         print("GCDID cache:", cache)
-        print(f"Depth supervision: GCIDC (CUDA, weight={self.opt.gcidc_weight})")
+        print(f"Depth supervision: single-frame GCIDC (CUDA, weight={self.opt.gcidc_weight})")
         print("GCIDC road cache:", self.opt.gcidc_road_cache)
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
@@ -626,25 +626,16 @@ class Trainer:
         depth = depth[:, 0] if depth.dim() == 4 else depth
         if "dynamic_mask" not in inputs:
             return depth.sum() * 0.0
-        B, H, W = depth.shape
         if inputs["dynamic_mask"].shape != depth.shape:
             raise ValueError("GCIDC mask must match the current training resolution")
-        # The first sample supplies the batch eligibility flag and spatial camera rays.
-        moving = inputs["dynamic_mask"].bool() & inputs["gcidc_batch_enabled"]
-        K = inputs[("K", 0)][:1, :3, :3].to(dtype=depth.dtype).expand(B, -1, -1)
+        moving = inputs["dynamic_mask"].bool()
+        K = inputs[("K", 0)][:, :3, :3].to(dtype=depth.dtype)
         road = inputs["gcidc_road"].bool()
         road = torch.where(inputs["gcidc_flipped"][:, None, None], road.flip(-1), road)
-        if outputs is not None and all(("cam_T_cam",0,s) in outputs for s in (-1,1)):
-            poses=torch.stack([outputs[("cam_T_cam",0,s)].detach() for s in (-1,1)], dim=1)
-        else:
-            # No temporal pose evidence in single-frame or stereo-only calls.
-            poses=depth.new_zeros((B,2,4,4))
         comp = gcidc.build_targets(
             depth.detach(), inputs["gcdid_grid"].long(), moving, K,
             inputs["gcidc_cells"], inputs["gcidc_cell_valid"],
-            inputs["gcidc_batch_index"], road, inputs["gcidc_flow"], inputs["gcidc_intrinsics"],
-            poses,
-            inputs["gcidc_flipped"], anchor_mask=inputs.get("gcidc_anchor_mask"))
+            inputs["gcidc_batch_index"], road)
         target, mask = comp["u_t"], comp["mask"]
         per_image = gcidc.loss_per_image(depth, target, mask)
         if outputs is not None:
@@ -1121,3 +1112,16 @@ class Trainer:
             self.model_optimizer.load_state_dict(optimizer_dict)
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
+
+
+def run_training():
+    from options import MonodepthOptions
+
+    opts = MonodepthOptions().parse()
+    if opts.no_cuda or not torch.cuda.is_available():
+        raise SystemExit("GCDID and GCIDC training requires a CUDA GPU")
+    seed = 3407
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    Trainer(opts).train()

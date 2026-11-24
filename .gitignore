@@ -1,10 +1,10 @@
-/.venv_train/
-/.venv_flow/
+/.venv_train
+/.venv_flow
 /.cache/
-/cache/
-/data/
-/candidates/
-/models/
+/cache
+/data
+/candidates
+/models
 /tmp/
 /results.txt
 __pycache__/

@@ -1,7 +1,7 @@
 """Build training masks from the GCDID ground-motion detector."""
 
 import argparse
-from contextlib import ExitStack
+from contextlib import nullcontext
 from hashlib import sha256
 import json
 import os
@@ -30,7 +30,6 @@ def arguments():
     parser.add_argument('--width', type=int, default=640)
     parser.add_argument('--gpu', default='0')
     parser.add_argument('--cache', type=Path)
-    parser.add_argument('--gcidc-flow-cache', type=Path)
     parser.add_argument('--gcidc-road-cache', type=Path)
     parser.add_argument('--limit', type=int, default=0)
     parser.add_argument('--frames', type=Path)
@@ -40,7 +39,7 @@ def arguments():
     args = parser.parse_args()
     if not 0 <= args.shard < args.shards:
         parser.error('--shard must be in [0, --shards)')
-    if (args.gcidc_flow_cache or args.gcidc_road_cache) and args.stage != 'all':
+    if args.gcidc_road_cache and args.stage != 'all':
         parser.error('GCIDC cache preparation requires --stage all')
     return args
 
@@ -99,12 +98,11 @@ def requested_keys(args):
     return keys[:args.limit] if args.limit else keys
 
 
-def build(args, flow_frames=None, road_frames=None, keys=None):
+def build(args, road_frames=None, keys=None):
     import torch
     from gcdid.ground.cuda_inputs import inputs, optical_matrix
     from gcdid.ground.detector import detect, empty_evidence
     from gcdid.flow import FlowModel
-    from gcdid.correspondence import save_flow
     from gcdid.instances import at_frame, candidate_grids, image_path
     from gcdid.road_cache import read_masks, resize_road, save_road
 
@@ -176,7 +174,7 @@ def build(args, flow_frames=None, road_frames=None, keys=None):
         np.savez_compressed(tmp, **arrays)
         tmp.replace(path)
 
-    def replay(key, grid, groups, save_correspondence=False, road_input=None):
+    def replay(key, grid, groups, road_input=None):
         nonlocal model
         number = int(key.split('__')[2])
         paths = [image_path(cfg['data'], at_frame(key, number + k)) for k in (-1, 0, 1)]
@@ -193,12 +191,7 @@ def build(args, flow_frames=None, road_frames=None, keys=None):
             if road_input is None:
                 road_input = inputs(cfg['road_masks'], key, flow.device, cfg['data'])
             road, intrinsics = road_input
-            evidence = detect(road, intrinsics, flow, torch.as_tensor(grid, device=flow.device), groups, endpoint_flow)
-            if save_correspondence and evidence['selected'].any():
-                dest = flow_frames / (key + '.npz')
-                if not dest.is_file():
-                    save_flow(dest, flow, cfg['data'], key, paths[1], h, w)
-            return evidence
+            return detect(road, intrinsics, flow, torch.as_tensor(grid, device=flow.device), groups, endpoint_flow)
 
     if args.stage in ('all', 'grids'):
         atomic_json(cache / 'config.json', cfg)
@@ -229,8 +222,7 @@ def build(args, flow_frames=None, road_frames=None, keys=None):
         if (h, w) != DETECTION_SIZE and len(groups):
             detector_grid = candidate_grids(candidate_path, *DETECTION_SIZE)[0]
         road_input = prepare_road(key, detection_needed=bool(len(groups)))
-        evidence = replay(key, detector_grid, groups, save_correspondence=flow_frames is not None,
-                          road_input=road_input)
+        evidence = replay(key, detector_grid, groups, road_input=road_input)
         selected = evidence['selected']
         flags = torch.cat((selected.new_zeros(1), selected))
         moving = flags[grid + 1]
@@ -262,31 +254,18 @@ def build(args, flow_frames=None, road_frames=None, keys=None):
                       selected_pixels=px, missing_triplets=unavailable, seconds=time.perf_counter()-clock)
         atomic_json(cache / 'summary.json', result)
         print('GCDID cache ready', cache, result, flush=True)
-        return positive_keys
 
 
 def main():
     args = arguments()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-    if args.gcidc_flow_cache is None and args.gcidc_road_cache is None:
-        build(args)
-        return
-    from gcdid.correspondence import complete_flow, correspondence_cache
     from gcdid.road_cache import road_cache
 
-    masks = args.cache or mask_cache(args.height, args.width, args.split)
     keys = requested_keys(args)
-    with ExitStack() as stack:
-        flow_frames = road_frames = None
-        if args.gcidc_flow_cache is not None:
-            flow_frames, spec = stack.enter_context(
-                correspondence_cache(args.gcidc_flow_cache, args.data, args.height, args.width))
-        if args.gcidc_road_cache is not None:
-            road_frames = stack.enter_context(road_cache(
-                args.gcidc_road_cache, args.road_masks, args.height, args.width, args.split, keys))
-        positive_keys = build(args, flow_frames, road_frames, keys)
-        if flow_frames is not None:
-            complete_flow(masks, flow_frames, spec, selected_keys=positive_keys)
+    roads = (road_cache(args.gcidc_road_cache, args.road_masks, args.height, args.width, args.split, keys)
+             if args.gcidc_road_cache is not None else nullcontext())
+    with roads as road_frames:
+        build(args, road_frames=road_frames, keys=keys)
 
 
 if __name__ == '__main__':

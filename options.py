@@ -9,7 +9,7 @@ from __future__ import absolute_import, division, print_function
 import os
 import argparse
 from pathlib import Path
-from gcdid.temporal import flow_cache, mask_cache
+from gcdid.temporal import mask_cache
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PROJECT_TMP = PROJECT_ROOT / "tmp"
@@ -246,7 +246,6 @@ class MonodepthOptions:
                                  type=str,
                                  default=None,
                                  help="offline GCDID masks for the selected detector and resolution")
-        self.parser.add_argument("--gcidc_flow_cache", type=str, default=None, help="Four-direction WAFT correspondence cache")
         self.parser.add_argument("--gcidc_road_cache", type=str, default=None,
                                  help="cached existing road masks for GCIDC")
 
@@ -265,10 +264,6 @@ class MonodepthOptions:
             self.options.gcdid_cache = str(mask_cache(self.options.height, self.options.width, self.options.split))
         elif not os.path.isabs(self.options.gcdid_cache):
             self.options.gcdid_cache = os.path.join(root, self.options.gcdid_cache)
-        if self.options.gcidc_flow_cache is None:
-            self.options.gcidc_flow_cache = str(flow_cache(self.options.height, self.options.width, self.options.gcdid_cache))
-        elif not os.path.isabs(self.options.gcidc_flow_cache):
-            self.options.gcidc_flow_cache = os.path.join(root,self.options.gcidc_flow_cache)
         if self.options.gcidc_road_cache is None:
             self.options.gcidc_road_cache = os.path.join(
                 root, "cache", "geometry", "GCIDC_roads_{}x{}".format(self.options.height, self.options.width))
