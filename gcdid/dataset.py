@@ -1,4 +1,5 @@
 """Attach cached GCDID selections to training samples."""
+from hashlib import sha256
 from pathlib import Path
 import json
 import numpy as np
@@ -27,6 +28,15 @@ class MotionDataset(Dataset):
             if metadata.get(kind) != expected or (metadata.get('height'), metadata.get('width')) != shape:
                 raise ValueError(f'Incompatible geometry cache: {directory}')
 
+        model = Path(cache) / 'motion_model.json'
+        if not model.is_file():
+            raise ValueError(f'Prepare the fitted GCDID cache with run_train.sh: {cache}')
+        contents = model.read_bytes()
+        summary = json.loads((Path(cache) / 'summary.json').read_text())
+        if summary.get('motion_model_sha256') != sha256(contents).hexdigest():
+            raise ValueError(f'GCDID cache model differs from its summary: {cache}')
+        self.motion_cut = json.loads(contents)['cut']
+
     def __len__(self):
         return len(self.base_dataset)
 
@@ -49,6 +59,8 @@ class MotionDataset(Dataset):
         flip = flipped[0]
         suffix = '_flip' if flip else ''
         with np.load(self.cache / name, allow_pickle=False) as z:
+            if float(z['threshold']) != self.motion_cut:
+                raise ValueError(f'GCDID frame uses a different fitted boundary: {key}')
             grid = z['grid' + suffix]
             if grid.shape != (base.height, base.width):
                 raise ValueError(f'GCDID mask shape mismatch: {key}')

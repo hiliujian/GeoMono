@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from .cuda_ops import envelopes
 from .visual_pose import homogeneous, visual_scene
-from .settings import H, W, motion_calibration
+from .settings import H, W
 
 
 @lru_cache(maxsize=8)
@@ -280,10 +280,3 @@ def measure(road, K, flow, grid, groups, endpoint_flow):
                contact_columns=columns.int(), contact=columns>0,
                road_h=poses[:,:,:3]+poses[:,:,3:]*normal, road_variance=variance)
     return out
-
-
-@torch.inference_mode()
-def detect(road,K,flow,grid,groups,endpoint_flow):
-    evidence=measure(road,K,flow,grid,groups,endpoint_flow)
-    evidence["selected"]=evidence["score"]>motion_calibration()["cut"]
-    return evidence
