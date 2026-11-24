@@ -66,10 +66,22 @@ def save_flow(path, flow, data, key, center, height, width):
 
 @torch.inference_mode()
 def complete_flow(masks, folder, spec, selected_keys=None):
+    from .riders import cache_stamp, prepare_riders
+
     manifest = (masks / "requested_frames.json").read_bytes()
     summary = (masks / "summary.json").read_bytes()
     source_hash = sha256(summary + manifest).hexdigest()
+    candidates = Path(json.loads(summary)["candidates"])
     seal = folder.parent / "summary.json"
+
+    def store_riders(settings):
+        stamp = cache_stamp(source_hash)
+        if settings.get("rider_stamp") == stamp and "rider_frames" in settings:
+            return
+        frames = prepare_riders(masks, folder, settings["keys"], stamp, candidates)
+        write_json(seal, dict(settings, rider_stamp=stamp, rider_frames=frames))
+        print("GCIDC rider inputs ready", len(frames), flush=True)
+
     if seal.exists():
         previous = json.loads(seal.read_text())
         selected = previous.get("keys", [])
@@ -77,6 +89,7 @@ def complete_flow(masks, folder, spec, selected_keys=None):
                 and len(selected) == previous.get("selected_frames")
                 and all((folder / (key + ".npz")).is_file() for key in selected)):
             print("Using completed GCIDC flow cache", folder.parent, flush=True)
+            store_riders(previous)
             return
     keys = json.loads(manifest)
     if selected_keys is None:
@@ -98,6 +111,6 @@ def complete_flow(masks, folder, spec, selected_keys=None):
         paths = [image_path(data, at_frame(key, number + offset)) for offset in (-1, 0, 1)]
         flow = model.triplet(paths, H, W)
         save_flow(dest, flow, data, key, paths[1], spec["height"], spec["width"])
-    write_json(seal, dict(**spec, frames=len(keys), selected_frames=len(selected_keys),
-                          keys=selected_keys, source_hash=source_hash))
+    store_riders(dict(**spec, frames=len(keys), selected_frames=len(selected_keys),
+                      keys=selected_keys, source_hash=source_hash))
     print("GCIDC flow ready", len(selected_keys), folder.parent, flush=True)

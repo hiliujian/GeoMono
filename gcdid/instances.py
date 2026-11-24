@@ -31,13 +31,18 @@ def image_path(data,key,extension='.jpg'):
     return Path(data)/date/drive/camera/'data'/(number+extension)
 
 
+def candidate_names(labels):
+    names = (str(name).strip().lower() for name in labels)
+    return [INDEX_TO_CLASS[int(name)] if name.isdigit() and int(name) < len(INDEX_TO_CLASS)
+            else name for name in names]
+
+
 def candidate_grids(path, height, width):
     """Decode packed crop bits directly at the two training orientations on CUDA."""
     path = Path(path)
     empty = torch.full((height,width), -1, device="cuda", dtype=torch.int16)
     with np.load(path,allow_pickle=False) as z:
-        labels = [str(s).strip().lower() for s in z["labels"]]
-        names = [INDEX_TO_CLASS[int(s)] if s.isdigit() and int(s)<len(INDEX_TO_CLASS) else s for s in labels]
+        names = candidate_names(z["labels"])
         groups = np.asarray([GROUPS[s] for s in names],np.int8)
         if not len(groups):
             return empty, empty, groups

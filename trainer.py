@@ -643,7 +643,7 @@ class Trainer:
             inputs["gcidc_cells"], inputs["gcidc_cell_valid"],
             inputs["gcidc_batch_index"], road, inputs["gcidc_flow"], inputs["gcidc_intrinsics"],
             poses,
-            inputs["gcidc_flipped"])
+            inputs["gcidc_flipped"], anchor_mask=inputs.get("gcidc_anchor_mask"))
         target, mask = comp["u_t"], comp["mask"]
         per_image = gcidc.loss_per_image(depth, target, mask)
         if outputs is not None:

@@ -207,7 +207,8 @@ def contact_profile(anchor, lower, upper, bottom, normal, observed, x, K, sample
 
 
 @torch.no_grad()
-def build_targets(depth, grid, moving, K, cells, cell_valid, batch_index, road, flow, intrinsics, poses, flipped):
+def build_targets(depth, grid, moving, K, cells, cell_valid, batch_index, road, flow, intrinsics, poses, flipped,
+                  anchor_mask=None):
     """Build one inverse-depth target map from grounded-instance evidence."""
     if not depth.is_cuda:
         raise ValueError('GCIDC target generation requires CUDA tensors')
@@ -227,7 +228,8 @@ def build_targets(depth, grid, moving, K, cells, cell_valid, batch_index, road, 
     selected = (valid & moving.flatten()[index]).any(1)
     rows,cols = cells.div(width, rounding_mode='floor'),cells.remainder(width)
     bottom = torch.full((instances,width),-1,device=depth.device,dtype=torch.long)
-    bottom.scatter_reduce_(1,cols,torch.where(valid,rows,-1),reduce='amax',include_self=True)
+    anchor = valid if anchor_mask is None else valid & anchor_mask.flatten()[index]
+    bottom.scatter_reduce_(1,cols,torch.where(anchor,rows,-1),reduce='amax',include_self=True)
     x = torch.arange(width, device=depth.device)[None]
     below = batch_index[:, None] * area + (bottom+1).clamp(max=height-1)*width + x
     adjacent = flat[below]
