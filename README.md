@@ -4,7 +4,7 @@ GeoMono 用 GCDID 从光度监督中排除运动实例，再用单帧 GCIDC 为�
 
 ## 运行
 
-需要 NVIDIA GPU、CUDA Toolkit（含 `nvcc`），以及 Python 3.8 和 3.10。深度训练和 WAFT 光流各用一个 Python 环境。
+需要 NVIDIA GPU、CUDA Toolkit（含 `nvcc`），以及 Python 3.8 和 3.10。深度训练和 GCDID 离线缓存准备各用一个 Python 环境。
 
 ```bash
 bash run_train.sh
@@ -20,9 +20,9 @@ bash run_train.sh
 | 由图像分割生成的实例候选 | `candidates/kitti_dynamic_mask/` |
 | 由图像分割生成的道路与标线掩码 | `data/road_masks/` |
 | MPViT-Small 初始化权重 | `models/mpvit_small.pth` |
-| WAFT-a1 的 tar-c-t 光流权重 | `models/waft/tar-c-t.pth` |
+| GCDID 运动检测用的 WAFT-a1 光流权重 | `models/waft/tar-c-t.pth` |
 
-初始化文件应与相应模型架构匹配。MPViT 文件包含 `model` 状态字典。ResNet-18 初始化由 torchvision 下载或从 `models/resnet18-f37072fd.pth` 读取。WAFT 将其特征提取器的中间特征用于光流，GCIDC 的深度输入来自 GeoMono 自己的网络。 [MonoViT](https://github.com/zxcqlf/MonoViT) · [WAFT](https://github.com/princeton-vl/WAFT)
+初始化文件应与相应模型架构匹配。MPViT 文件包含 `model` 状态字典。ResNet-18 初始化由 torchvision 下载或从 `models/resnet18-f37072fd.pth` 读取。 [MonoViT](https://github.com/zxcqlf/MonoViT) · [WAFT](https://github.com/princeton-vl/WAFT)
 
 可用 `GCDID_DATA`、`GCDID_CANDIDATES` 和 `GCDID_ROAD_MASKS` 指向已有输入。可用 `GEOMONO_TRAIN_PYTHON` 和 `GEOMONO_FLOW_PYTHON` 指定两个 Python 可执行文件。KITTI Raw 的 JPEG 图像按日期、行程及 `image_02/data` 或 `image_03/data` 放置。 [KITTI Raw](https://www.cvlibs.net/datasets/kitti/raw_data.php)
 
@@ -81,10 +81,7 @@ GCIDC（Ground Contact Inverse Depth Constraint，地面接触逆深度约束）
 bash tensorboard.sh 6006
 ```
 
-`gcdid/panel_N` 同时显示目标图像、候选、运动掩码、光度损失排除区和光度误差。`gcidc/panel_N` 显示同一样本的选区、预测深度、几何目标和约束方向。单图深度推理只需要深度网络。可用 `bash evaluate.sh <权重目录> <GPU编号>` 对已保存的权重做独立深度评估。评估前可运行 `.venv_train/bin/python export_gt_depth.py --data_path data/kitti --split eigen` 生成评估真值。
-
-
-缓存构建和自监督训练使用图像、图像派生掩码与光流、相机光学内参与模型预测。官方轨迹、OXTS 和 LiDAR 由独立评分流程读取。默认训练参数包含 `--no_eval`。
+`gcdid/panel_N` 同时显示目标图像、候选、运动掩码、光度损失排除区和光度误差。`gcidc/panel_N` 显示同一样本的选区、预测深度、几何目标和约束方向。单图深度推理只需要深度网络。可用 `bash evaluate.sh <权重目录> <GPU编号>` 对已保存的权重做独立深度评估。评估前可运行 `.venv_train/bin/python export_gt_depth.py --data_path data/kitti --split eigen` 从 LiDAR 生成深度真值。
 
 ## 许可
 

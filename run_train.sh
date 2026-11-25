@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: bash run_train.sh [tag] [GPU index|auto]
-# Prepare GCDID masks offline, then train with the Ground Contact Inverse Depth Constraint (GCIDC).
+# Prepare GCDID masks offline, then train with single-frame GCIDC.
 set -euo pipefail
 PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT"
