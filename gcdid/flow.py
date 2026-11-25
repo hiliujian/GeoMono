@@ -1,4 +1,3 @@
-"""Official WAFT-a1 inference, used only during offline mask preparation."""
 from pathlib import Path
 from types import SimpleNamespace
 import sys,json
