@@ -130,9 +130,7 @@ def calibration_signature(reference, args):
     assets = set()
     data = Path(args.data)
     for key in reference:
-        date, _, frame, _ = key.split('__')
-        optics = data / date / 'camera_intrinsics.json'
-        assets.add(optics if optics.is_file() else data / date / 'calib_cam_to_cam.txt')
+        _, _, frame, _ = key.split('__')
         assets.add(Path(args.candidates) / (key + '.npz'))
         assets.add(Path(args.road_masks) / (key + '.npz'))
         assets.update(image_path(data, at_frame(key, int(frame) + step)) for step in (-1, 0, 1))
@@ -148,7 +146,8 @@ def calibration_signature(reference, args):
 
 def build(args, road_frames=None, keys=None):
     import torch
-    from gcdid.ground.cuda_inputs import inputs, optical_matrix
+    from gcdid.ground.cuda_inputs import inputs
+    from gcdid.ground.camera import intrinsics
     from gcdid.ground.detector import measure, empty_evidence
     from gcdid.ground.reference import fit_reference, grouped_evidence, grouped_sources, observation_regions, reference_grid
     from gcdid.flow import FlowModel
@@ -170,6 +169,7 @@ def build(args, road_frames=None, keys=None):
         geometry_backend='cuda', grid_sha256=sha256((ROOT / 'gcdid/instances.py').read_bytes() +
                                                   (ROOT / 'gcdid/sampling.py').read_bytes()).hexdigest(),
         calibration_source='unlabelled_rgb', pose_source='visual_road_background_pose',
+        intrinsics_source='framework_approximate',
         motion_evidence='stationary_column_reprojection',
         offsets=[-1, 0, 1], waft='a1/tar-c-t',
     )
@@ -199,8 +199,7 @@ def build(args, road_frames=None, keys=None):
                 training_road = resize_road(native_road, h, w)
             save_road(destination, training_road)
         if detection_needed:
-            native_height, native_width = native_road.shape
-            K = optical_matrix(cfg['data'], key, native_width, native_height, masks.device)
+            K = intrinsics(H, W, masks.device)
             return detector_road, K
 
     model = None
@@ -268,15 +267,15 @@ def build(args, road_frames=None, keys=None):
             lineage = grouped_sources(candidates, semantics)
             parents = None
             if all(lineage):
-                native, road, width, height, sources = reference_grid(semantics, grid)
+                native, road, _, _, sources = reference_grid(semantics, grid)
                 grid, parents = observation_regions(grid, native, sources, lineage)
                 prepare_road(key, shared=road)
-                intrinsics = optical_matrix(cfg['data'], key, width, height, flow.device)
+                K = intrinsics(H, W, flow.device)
             elif road_frames is not None:
-                road, intrinsics = prepare_road(key, detection_needed=True)
+                road, K = prepare_road(key, detection_needed=True)
             else:
-                road, intrinsics = inputs(cfg['road_masks'], key, flow.device, cfg['data'])
-            parts = measure(road, intrinsics, flow, grid, groups if parents is None else groups[parents], endpoint_flow)
+                road, K = inputs(cfg['road_masks'], key, flow.device)
+            parts = measure(road, K, flow, grid, groups if parents is None else groups[parents], endpoint_flow)
             out = grouped_evidence(parts, parents, len(groups))
             out['selected'] = out['score'] > threshold
             return out

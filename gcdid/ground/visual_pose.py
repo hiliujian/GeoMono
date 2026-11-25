@@ -31,11 +31,12 @@ def rotation(omega):
 
 def visual_scene(xy, road, grid, K, flow, reverse_at, visible):
     """The road inverse depth in camera-height units is n.r; background depths are profiled out."""
-    from .cuda_inputs import intrinsics
+    from .camera import NORMALIZED_K
     height, width = road.shape
     f, c = K.diag()[:2], K[:2, 2]
-    # Transfer the learned pixel horizon from the calibration grid to the current optics.
-    nominal = intrinsics(height, width, K.device)
+    nominal = K.new_tensor(NORMALIZED_K)[:3, :3]
+    nominal[0] *= width
+    nominal[1] *= height
     prior = road_prior()
     transform = K.T @ torch.linalg.inv(nominal.T)
     normal = transform @ K.new_tensor(prior["normal"])

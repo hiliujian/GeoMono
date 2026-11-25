@@ -7,7 +7,7 @@ import torch
 
 from ..instances import GROUPS, at_frame, candidate_grids, candidate_names, image_path
 from ..sampling import nearest_axis
-from .cuda_inputs import optical_matrix
+from .camera import intrinsics
 from .detector import empty_evidence, measure
 from .settings import H, W, ROAD
 
@@ -152,20 +152,20 @@ def fit_reference(keys, settings, model):
         grid, _, groups = candidate_grids(candidates, H, W)
         if not len(groups) or not (grid >= 0).any():
             continue
-        native, road, width, height, sources = reference_grid(semantics, grid)
+        native, road, _, _, sources = reference_grid(semantics, grid)
         regions, parents = observation_regions(grid, native, sources, grouped_sources(candidates, semantics))
-        intrinsics = optical_matrix(settings['data'], key, width, height, grid.device)
+        K = intrinsics(H, W, grid.device)
         frame = int(key.split('__')[2])
         paths = [image_path(settings['data'], at_frame(key, frame + offset)) for offset in (-1, 0, 1)]
         flow, span = model().triplet(paths, H, W, endpoints=True)
         labels = torch.as_tensor(groups, device=grid.device)
-        parts = measure(road, intrinsics, flow, regions, labels if parents is None else labels[parents], span)
+        parts = measure(road, K, flow, regions, labels if parents is None else labels[parents], span)
         measurements[key] = (grouped_evidence(parts, parents, len(groups)), road)
         if same_partition(regions, native):
             samples.append(parts['score'][regions[regions >= 0].long().unique()])
         elif (native >= 0).any():
             size = int(native.max()) + 1
-            observation = measure(road, intrinsics, flow, native, native.new_zeros(size), span)
+            observation = measure(road, K, flow, native, native.new_zeros(size), span)
             samples.append(observation['score'][native[native >= 0].long().unique()])
     if not samples:
         raise ValueError('No visible semantic instances in the unlabelled training reference')
