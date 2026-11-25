@@ -1,9 +1,23 @@
 """Cache locations and formats for training masks."""
 from pathlib import Path
 
-CACHE = Path(__file__).resolve().parents[1] / 'cache' / 'geometry'
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_TMP = PROJECT_ROOT / 'tmp'
+CACHE = PROJECT_TMP / 'cache' / 'geometry'
 DETECTOR = 'GCDID ground parallax'
 ROAD_FORMAT = 'road-union-nearest-exact'
+
+
+def output_path(path):
+    """Keep generated experiment files physically inside the project tmp directory."""
+    directory = (PROJECT_ROOT / Path(path).expanduser()).resolve()
+    if directory != PROJECT_TMP and PROJECT_TMP not in directory.parents:
+        raise ValueError(f'Output directory must be inside {PROJECT_TMP}')
+    return directory
+
+
+def road_mask_cache(height, width):
+    return CACHE / f'GCIDC_roads_{height}x{width}'
 
 
 def mask_cache(height, width, split=None):

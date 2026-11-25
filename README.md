@@ -53,10 +53,14 @@ GCDID（Ground-Constrained Dynamic Instance Detection，地面约束动态实例
 | 数据目录 | `data/kitti/` |
 | 实例候选 | `candidates/kitti_dynamic_mask/` |
 | 路面分割 | `data/road_masks/` |
-| 缓存 | `cache/geometry/` 下的 GCDID 掩码和目标帧道路掩码 |
+| 缓存 | `tmp/cache/geometry/` 下的 GCDID 掩码和目标帧道路掩码 |
+| CUDA 编译缓存 | `tmp/cache/cuda/` |
 | 训练输出 | `tmp/<实验名>/models/weights_*` |
+| 独立评估输出 | `tmp/evaluation/<实验名>/<权重目录>/<评估划分>/` |
 
 默认保存每轮的训练权重，日志点会使用验证批次写 TensorBoard。`--no_eval` 控制每轮末的完整深度评估。训练数据加载器只读取训练需要的图像和几何缓存。
+
+实验日志、权重、缓存、评估结果和效果图统一放在项目自己的 `tmp/` 下。自定义输出路径也必须实际位于该目录内。`tmp/` 由 Git 忽略，实验产物保存在本机。
 
 ## 逆深度约束
 

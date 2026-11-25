@@ -125,7 +125,8 @@ def evaluate(opt):
 
     print("\n   Trajectory error: {:0.3f}, std: {:0.3f}\n".format(np.mean(ates), np.std(ates)))
 
-    save_path = os.path.join(opt.load_weights_folder, "poses.npy")
+    os.makedirs(opt.eval_out_dir, exist_ok=True)
+    save_path = os.path.join(opt.eval_out_dir, "poses.npy")
     np.save(save_path, pred_poses)
     print("-> Predictions saved to", save_path)
 

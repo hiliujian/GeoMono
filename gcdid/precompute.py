@@ -14,7 +14,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from gcdid.ground.settings import H, W
-from gcdid.temporal import DETECTOR, mask_cache
+from gcdid.temporal import DETECTOR, mask_cache, output_path
 
 DETECTION_SIZE = (H, W)
 DEFAULT_ROADS = str(ROOT / 'data/road_masks')
@@ -41,6 +41,12 @@ def arguments():
         parser.error('--shard must be in [0, --shards)')
     if args.gcidc_road_cache and args.stage != 'all':
         parser.error('GCIDC cache preparation requires --stage all')
+    try:
+        args.cache = output_path(args.cache or mask_cache(args.height, args.width, args.split))
+        if args.gcidc_road_cache is not None:
+            args.gcidc_road_cache = output_path(args.gcidc_road_cache)
+    except ValueError as err:
+        parser.error(str(err))
     return args
 
 

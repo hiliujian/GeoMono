@@ -62,6 +62,7 @@ def evaluate(opt):
     """
     MIN_DEPTH = 1e-3
     MAX_DEPTH = 80
+    os.makedirs(opt.eval_out_dir, exist_ok=True)
 
     assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
         "Please choose mono or stereo evaluation by setting either --eval_mono or --eval_stereo"
@@ -140,7 +141,7 @@ def evaluate(opt):
 
     if opt.save_pred_disps:
         output_path = os.path.join(
-            opt.load_weights_folder, "disps_{}_split.npy".format(opt.eval_split))
+            opt.eval_out_dir, "disps_{}_split.npy".format(opt.eval_split))
         print("-> Saving predicted disparities to ", output_path)
         np.save(output_path, pred_disps)
 
@@ -149,7 +150,7 @@ def evaluate(opt):
         quit()
 
     elif opt.eval_split == 'benchmark':
-        save_dir = os.path.join(opt.load_weights_folder, "benchmark_predictions")
+        save_dir = os.path.join(opt.eval_out_dir, "benchmark_predictions")
         print("-> Saving out benchmark predictions to {}".format(save_dir))
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -190,7 +191,7 @@ def evaluate(opt):
         # -----------------------------visualize color map-----------------------------
         # The checkpoint evaluation has frame names for the per-image output.
         if opt.ext_disp_to_eval is None:
-            save_dir = os.path.join(opt.load_weights_folder, "vis_pic", "kitti")
+            save_dir = os.path.join(opt.eval_out_dir, "vis_pic", "kitti")
             os.makedirs(os.path.join(save_dir, "sr"), exist_ok=True)
             pic_name = filenames[i].split()[0].split('/')[-1]+'_'+filenames[i].split()[1]+'_sr.png'
             plt.imsave(os.path.join(save_dir,'sr',pic_name), pred_disp, cmap='magma')
@@ -237,7 +238,7 @@ def evaluate(opt):
 
 
     os.makedirs(opt.log_dir, exist_ok=True)
-    with open(os.path.join(opt.log_dir, 'results.txt'), mode='a') as results_edit:
+    with open(os.path.join(opt.eval_out_dir, 'results.txt'), mode='a') as results_edit:
         results_edit.write("\n " + 'model_name: %s '%(opt.load_weights_folder))
         results_edit.write("\n " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
         results_edit.write("\n " + ("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")

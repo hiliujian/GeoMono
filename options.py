@@ -9,17 +9,10 @@ from __future__ import absolute_import, division, print_function
 import os
 import argparse
 from pathlib import Path
-from gcdid.temporal import mask_cache
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-PROJECT_TMP = PROJECT_ROOT / "tmp"
-
+from gcdid.temporal import PROJECT_ROOT, PROJECT_TMP, mask_cache, output_path, road_mask_cache
 
 def resolve_log_dir(path):
-    directory = (PROJECT_ROOT / Path(path).expanduser()).resolve()
-    if directory != PROJECT_TMP and PROJECT_TMP not in directory.parents:
-        raise ValueError(f"Output directory must be inside {PROJECT_TMP}")
-    return str(directory)
+    return str(output_path(path))
 
 
 def validate_model_name(name):
@@ -257,17 +250,17 @@ class MonodepthOptions:
             resolve_log_dir(Path(self.options.log_dir) / name)
         except ValueError as err:
             self.parser.error(str(err))
-        # Cache and checkpoint paths may be given relative to the project root;
-        # resolve them there so runs do not depend on the current directory.
-        root = os.path.dirname(os.path.abspath(__file__))
-        if self.options.gcdid_cache is None:
-            self.options.gcdid_cache = str(mask_cache(self.options.height, self.options.width, self.options.split))
-        elif not os.path.isabs(self.options.gcdid_cache):
-            self.options.gcdid_cache = os.path.join(root, self.options.gcdid_cache)
-        if self.options.gcidc_road_cache is None:
-            self.options.gcidc_road_cache = os.path.join(
-                root, "cache", "geometry", "GCIDC_roads_{}x{}".format(self.options.height, self.options.width))
-        elif not os.path.isabs(self.options.gcidc_road_cache):
-            self.options.gcidc_road_cache = os.path.join(root, self.options.gcidc_road_cache)
+        try:
+            masks = self.options.gcdid_cache or mask_cache(
+                self.options.height, self.options.width, self.options.split)
+            roads = self.options.gcidc_road_cache or road_mask_cache(
+                self.options.height, self.options.width)
+            self.options.gcdid_cache = str(output_path(masks))
+            self.options.gcidc_road_cache = str(output_path(roads))
+            weights = Path(self.options.load_weights_folder or self.options.ext_disp_to_eval or self.options.model_name)
+            evaluation = PROJECT_TMP / 'evaluation' / weights.parent.parent.name / weights.name / self.options.eval_split
+            self.options.eval_out_dir = str(output_path(self.options.eval_out_dir or evaluation))
+        except ValueError as err:
+            self.parser.error(str(err))
         return self.options
 
